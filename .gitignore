@@ -65,3 +65,7 @@ health_report.json
 *.tmp
 *.temp
 .cache/
+
+# Runtime-generated memory artefacts (summaries + index state)
+claude_summaries/
+index_state.json
