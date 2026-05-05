@@ -6,6 +6,7 @@ Sources:
   1. Compacted summaries: ~/.claude/compacted-summaries/*.md
   2. Auto Memory topic files: ~/.claude/projects/.../memory/*.md
   3. Daily logs: 00-core/.context/memory/daily/*.md
+  4. Session checkpoints: 00-core/.context/session/checkout-*.md
 
 Supports incremental indexing (only new/changed files).
 """
@@ -60,10 +61,27 @@ if not DAILY_LOGS_DIR.exists():
         / "daily"
     )
 
+SESSION_DIR = (
+    Path(__file__).parent.parent.parent.parent
+    / "00-core"
+    / ".context"
+    / "session"
+)
+if not SESSION_DIR.exists():
+    SESSION_DIR = (
+        Path.home()
+        / "Documents"
+        / "Git-Local"
+        / "00-core"
+        / ".context"
+        / "session"
+    )
+
 SOURCES = {
     "summary": {"dir": SUMMARIES_DIR, "prefix": "summary:"},
     "topic": {"dir": TOPIC_FILES_DIR, "prefix": "topic:"},
     "daily": {"dir": DAILY_LOGS_DIR, "prefix": "daily:"},
+    "session": {"dir": SESSION_DIR, "prefix": "session:", "glob": "checkout-*.md"},
 }
 
 # Tech keywords for metadata extraction
@@ -192,12 +210,13 @@ def index_all(incremental: bool = True) -> None:
     for source_type, config in SOURCES.items():
         source_dir = config["dir"]
         prefix = config["prefix"]
+        glob_pattern = config.get("glob", "*.md")
 
         if not source_dir.exists():
             console.print(f"[yellow]Source dir not found: {source_dir}[/yellow]")
             continue
 
-        files = list(source_dir.glob("*.md"))
+        files = list(source_dir.glob(glob_pattern))
         console.print(f"\n[cyan]{source_type}: {len(files)} files in {source_dir}[/cyan]")
 
         for filepath in track(files, description=f"Indexing {source_type}..."):
