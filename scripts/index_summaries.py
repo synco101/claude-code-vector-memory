@@ -180,6 +180,70 @@ def create_document_text(content: str, metadata: dict) -> str:
     return "\n".join(parts)
 
 
+# --- Chunking -------------------------------------------------------------------------------
+#
+# The embedding model's window is 128 word-piece tokens. Until 2026-08-28 this indexer stored ONE
+# embedding per whole file, so everything past the first ~128 tokens was invisible to search: a
+# 31 460-token daily log was represented by 0.41 % of itself, and the dated archive files created
+# that day embedded only their identical split headers (pairwise cosine up to 0.997). The layer
+# looked configured and was effectively blind — a search for a fact quoted verbatim in an archive
+# returned it 7th out of 10.
+#
+# Calibrated by measurement, not by arithmetic. A first attempt used 330 content characters plus
+# a 60-character overlap on the assumption of 3.08 chars/token; measuring the real chunks gave a
+# MEDIAN of 129 tokens and a maximum of 181 — 122 of 228 chunks were still being truncated by the
+# very window this change exists to respect. Markdown with paths, code spans and issue numbers
+# runs closer to 2.5 chars/token than prose does. Budget below is content + overlap together, and
+# the acceptance test asserts max <= 128 on real files.
+CHARS_PER_TOKEN = 2.5
+CHUNK_CHARS = 230
+CHUNK_OVERLAP_CHARS = 45
+
+
+def chunk_content(content: str) -> list[str]:
+    """Split file content into overlapping, window-sized chunks on line boundaries.
+
+    Line boundaries are kept because these files are Markdown logs: a chunk that starts mid
+    sentence embeds worse than one that starts at a heading or a bullet. A single line longer
+    than the budget is hard-split — a 900-character paragraph is common in these notes.
+    """
+    chunks: list[str] = []
+    buf: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal buf, size
+        if buf:
+            chunks.append("\n".join(buf).strip())
+            buf, size = [], 0
+
+    for line in content.splitlines():
+        if len(line) > CHUNK_CHARS:
+            flush()
+            for i in range(0, len(line), CHUNK_CHARS - CHUNK_OVERLAP_CHARS):
+                piece = line[i : i + CHUNK_CHARS].strip()
+                if piece:
+                    chunks.append(piece)
+            continue
+        if size + len(line) + 1 > CHUNK_CHARS:
+            flush()
+        buf.append(line)
+        size += len(line) + 1
+    flush()
+
+    chunks = [c for c in chunks if c]
+    if not chunks:
+        return []
+
+    # Carry a tail of the previous chunk into the next one so a fact split across the boundary is
+    # still retrievable from at least one side.
+    overlapped = [chunks[0]]
+    for prev, cur in zip(chunks, chunks[1:]):
+        tail = prev[-CHUNK_OVERLAP_CHARS:]
+        overlapped.append(f"{tail}\n{cur}" if tail.strip() else cur)
+    return overlapped
+
+
 def index_all(incremental: bool = True) -> None:
     """Index all memory sources."""
     console.print("[cyan]Initializing semantic memory system...[/cyan]")
@@ -205,6 +269,7 @@ def index_all(incremental: bool = True) -> None:
     new_state = {}
     indexed_count = 0
     skipped_count = 0
+    chunk_count = 0
     results = []
 
     for source_type, config in SOURCES.items():
@@ -240,14 +305,35 @@ def index_all(incremental: bool = True) -> None:
                     continue
 
                 metadata = extract_metadata(content, filepath.name, source_type)
-                doc_text = create_document_text(content, metadata)
 
-                collection.upsert(
-                    ids=[doc_id],
-                    documents=[doc_text],
-                    metadatas=[metadata],
-                )
+                # Chunk count varies as a file is edited, so stale chunks from the previous run
+                # must go before the new ones land — an upsert alone would leave orphans that
+                # still answer queries with deleted text.
+                try:
+                    collection.delete(where={"parent_id": doc_id})
+                except Exception:
+                    pass
 
+                pieces = chunk_content(content)
+                # Chunk 0 is the file's identity card (title, description, type, source) — the
+                # same text the old one-embedding-per-file scheme stored. Keeping it means a
+                # query phrased like a file's description still finds the file.
+                header = create_document_text("", metadata).strip()
+                docs = [header] + pieces
+                ids = [f"{doc_id}#{i}" for i in range(len(docs))]
+                metas = [
+                    {**metadata, "parent_id": doc_id, "chunk_index": i, "n_chunks": len(docs)}
+                    for i in range(len(docs))
+                ]
+
+                for start in range(0, len(docs), 256):
+                    collection.upsert(
+                        ids=ids[start : start + 256],
+                        documents=docs[start : start + 256],
+                        metadatas=metas[start : start + 256],
+                    )
+
+                chunk_count += len(docs)
                 indexed_count += 1
                 results.append({
                     "source": source_type,
@@ -262,7 +348,7 @@ def index_all(incremental: bool = True) -> None:
     save_index_state(new_state)
 
     # Summary
-    console.print(f"\n[green]Indexed: {indexed_count} | Skipped (unchanged): {skipped_count} | Total in DB: {collection.count()}[/green]")
+    console.print(f"\n[green]Indexed: {indexed_count} files -> {chunk_count} chunks | Skipped (unchanged): {skipped_count} | Total in DB: {collection.count()}[/green]")
 
     if results:
         table = Table(title="Newly Indexed Documents")

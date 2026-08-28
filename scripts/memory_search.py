@@ -65,14 +65,28 @@ class MemorySearcher:
         min_similarity: float = 0.3,
         source_filter: str | None = None,
     ) -> list[dict]:
-        """Search with optional source filtering (summary, topic, daily)."""
+        """Search with optional source filtering.
+
+        `source_filter` accepts one source or several separated by commas
+        ("session,daily,summary"). The multi-source form is what the narrative archive needs:
+        checkouts, daily logs and compacted summaries are the corpus grep cannot reach by
+        keyword, while topic files stay on the grep + frontmatter-description route that
+        Claude Code is designed around.
+        """
         where_filter = None
         if source_filter:
-            where_filter = {"source_type": source_filter}
+            sources = [s.strip() for s in source_filter.split(",") if s.strip()]
+            if len(sources) == 1:
+                where_filter = {"source_type": sources[0]}
+            elif sources:
+                where_filter = {"source_type": {"$in": sources}}
 
+        # Files are indexed as ~110-token chunks (see index_summaries.py § Chunking), so a single
+        # file can occupy many of the nearest neighbours. Over-fetch, then collapse to one result
+        # per file keeping its best-scoring chunk — otherwise three hits could all be one document.
         results = self.collection.query(
             query_texts=[query],
-            n_results=n_results * 2,
+            n_results=max(n_results * 20, 60),
             include=["metadatas", "documents", "distances"],
             where=where_filter,
         )
@@ -130,10 +144,26 @@ class MemorySearcher:
                 "preview": preview,
                 "memory_type": metadata.get("memory_type", ""),
                 "description": metadata.get("description", ""),
+                "parent_id": metadata.get("parent_id", ""),
+                "chunk_index": metadata.get("chunk_index", 0),
             })
 
         processed.sort(key=lambda x: x["hybrid_score"], reverse=True)
-        return processed[:n_results]
+
+        # Collapse chunks back to files: best chunk wins, and its text becomes the preview — which
+        # is the point of chunking, since that excerpt is the passage that actually matched rather
+        # than the first 15 lines of the file.
+        best_per_file: dict[str, dict] = {}
+        for r in processed:
+            key = r.get("parent_id") or r["filename"]
+            if key not in best_per_file:
+                r["chunks_matched"] = 1
+                best_per_file[key] = r
+            else:
+                best_per_file[key]["chunks_matched"] += 1
+
+        collapsed = sorted(best_per_file.values(), key=lambda x: x["hybrid_score"], reverse=True)
+        return collapsed[:n_results]
 
     def display_results(self, results: list[dict], query: str) -> None:
         if not results:
@@ -177,21 +207,58 @@ class MemorySearcher:
             print(f"\n{r['preview'][:400]}\n")
 
 
+RETRIEVAL_LOG = Path(__file__).parent.parent / "logs" / "retrievals.jsonl"
+
+
+def log_retrieval(query: str, source_filter: str | None, caller: str, results: list) -> None:
+    """Append one line per search so the layer can be judged on evidence later.
+
+    Until 2026-08-28 this store was indexed every six hours and never read once — there was no
+    record of a single search. Without a log, "is the vector layer worth keeping?" stays a matter
+    of opinion. Failures here are swallowed: logging must never break a search.
+    """
+    try:
+        RETRIEVAL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "query": query,
+            "source": source_filter,
+            "caller": caller,
+            "hits": [
+                {
+                    "file": r.get("filename"),
+                    "source": r.get("source_type"),
+                    "score": round(r.get("hybrid_score", 0), 3),
+                }
+                for r in results[:3]
+            ],
+            "n": len(results),
+        }
+        with RETRIEVAL_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def main():
     if len(sys.argv) < 2:
-        console.print("[red]Usage: python memory_search.py <query> [--source summary|topic|daily] [--compact][/red]")
+        console.print("[red]Usage: python memory_search.py <query> [--source session,daily,summary|topic] [--compact] [--caller NAME][/red]")
         sys.exit(1)
 
     # Parse args
     args = sys.argv[1:]
     source_filter = None
     compact = False
+    caller = "manual"
     query_parts = []
 
     i = 0
     while i < len(args):
         if args[i] == "--source" and i + 1 < len(args):
             source_filter = args[i + 1]
+            i += 2
+        elif args[i] == "--caller" and i + 1 < len(args):
+            caller = args[i + 1]
             i += 2
         elif args[i] == "--compact":
             compact = True
@@ -207,6 +274,7 @@ def main():
 
     searcher = MemorySearcher()
     results = searcher.search(query, n_results=3, source_filter=source_filter)
+    log_retrieval(query, source_filter, caller, results)
 
     if compact:
         searcher.display_compact(results, query)
