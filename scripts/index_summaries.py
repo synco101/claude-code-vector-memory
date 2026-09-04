@@ -77,11 +77,25 @@ if not SESSION_DIR.exists():
         / "session"
     )
 
+WIKI_DIR = (
+    Path(__file__).parent.parent.parent.parent / "00-core" / "wiki"
+)
+if not WIKI_DIR.exists():
+    WIKI_DIR = Path.home() / "Documents" / "Git-Local" / "00-core" / "wiki"
+
+# `path_id: True` makes the document id the path relative to the source dir instead of the bare
+# filename. Required for any recursive source: the wiki keeps `inbox/`, `knowledge/`, `projects/`
+# and `people/` side by side, so two `index.md` would otherwise share one id and overwrite each
+# other. The four original sources keep filename ids — changing them would invalidate all 811
+# entries of index_state.json and force a ~28-minute full rebuild for no gain.
 SOURCES = {
     "summary": {"dir": SUMMARIES_DIR, "prefix": "summary:"},
     "topic": {"dir": TOPIC_FILES_DIR, "prefix": "topic:"},
     "daily": {"dir": DAILY_LOGS_DIR, "prefix": "daily:"},
     "session": {"dir": SESSION_DIR, "prefix": "session:", "glob": "checkout-*.md"},
+    # The wiki is Golden Rule #15's compounding knowledge layer, yet none of its 364 files were
+    # searchable by meaning — the only way in was grep on index.md. Added 2026-09-04.
+    "wiki": {"dir": WIKI_DIR, "prefix": "wiki:", "glob": "**/*.md", "path_id": True},
 }
 
 # Tech keywords for metadata extraction
@@ -244,7 +258,7 @@ def chunk_content(content: str) -> list[str]:
     return overlapped
 
 
-def index_all(incremental: bool = True) -> None:
+def index_all(incremental: bool = True, prune_force: bool = False) -> None:
     """Index all memory sources."""
     console.print("[cyan]Initializing semantic memory system...[/cyan]")
     console.print(f"[cyan]Embedding model: {EMBEDDING_MODEL}[/cyan]")
@@ -267,6 +281,7 @@ def index_all(incremental: bool = True) -> None:
     # Load previous state for incremental indexing
     prev_state = load_index_state() if incremental else {}
     new_state = {}
+    scanned_prefixes = set()   # only prefixes whose directory was actually read this run
     indexed_count = 0
     skipped_count = 0
     chunk_count = 0
@@ -281,7 +296,8 @@ def index_all(incremental: bool = True) -> None:
             console.print(f"[yellow]Source dir not found: {source_dir}[/yellow]")
             continue
 
-        files = list(source_dir.glob(glob_pattern))
+        files = [f for f in source_dir.glob(glob_pattern) if f.is_file()]
+        scanned_prefixes.add(prefix)
         console.print(f"\n[cyan]{source_type}: {len(files)} files in {source_dir}[/cyan]")
 
         for filepath in track(files, description=f"Indexing {source_type}..."):
@@ -289,7 +305,9 @@ def index_all(incremental: bool = True) -> None:
             if filepath.name == "MEMORY.md":
                 continue
 
-            doc_id = f"{prefix}{filepath.name}"
+            name = (str(filepath.relative_to(source_dir)) if config.get("path_id")
+                    else filepath.name)
+            doc_id = f"{prefix}{name}"
             mtime = os.path.getmtime(filepath)
             new_state[doc_id] = mtime
 
@@ -344,6 +362,42 @@ def index_all(incremental: bool = True) -> None:
             except Exception as e:
                 console.print(f"[red]Error indexing {filepath.name}: {e}[/red]")
 
+    # --- prune chunks whose source file is gone -------------------------------------------------
+    # Until 2026-09-04 nothing did this. new_state was rebuilt from what exists on disk and
+    # overwrote the old one, so a deleted OR RENAMED file silently dropped out of the state file
+    # while its chunks stayed in Chroma forever, still answering queries with text that no longer
+    # exists anywhere. The store only looked clean because it had been rebuilt from zero on
+    # 2026-08-28 and nothing had been removed since. That stops being true the moment the weekly
+    # memory pass starts moving rows and splitting topic files, which is exactly what it does.
+    pruned_files = 0
+    if incremental and prev_state:
+        orphans = [
+            doc_id for doc_id in prev_state
+            if doc_id not in new_state
+            # Only prune under a prefix whose directory was actually read this run. A source dir
+            # that is temporarily unreadable (unmounted volume, a TCC denial) is skipped above
+            # with a yellow warning — without this guard that skip would delete every document
+            # of that source.
+            and any(doc_id.startswith(pfx) for pfx in scanned_prefixes)
+        ]
+        # A run that wants to remove more than a fifth of the index is not maintenance, it is an
+        # accident. Report it and change nothing; `--prune-force` is the deliberate override.
+        limit = max(20, len(prev_state) // 5)
+        if len(orphans) > limit and not prune_force:
+            console.print(
+                f"[red]Pruning SKIPPED: {len(orphans)} documents look orphaned, over the safety "
+                f"limit of {limit}. Nothing deleted. Check the source directories, then rerun "
+                f"with --prune-force if this is genuinely correct.[/red]")
+        else:
+            for doc_id in orphans:
+                try:
+                    collection.delete(where={"parent_id": doc_id})
+                    pruned_files += 1
+                except Exception as e:
+                    console.print(f"[red]Error pruning {doc_id}: {e}[/red]")
+            if pruned_files:
+                console.print(f"[yellow]Pruned {pruned_files} documents whose source file is gone[/yellow]")
+
     # Save new state
     save_index_state(new_state)
 
@@ -370,4 +424,4 @@ if __name__ == "__main__":
     full_rebuild = "--full" in sys.argv
     if full_rebuild:
         console.print("[yellow]Full rebuild mode (ignoring previous state)[/yellow]")
-    index_all(incremental=not full_rebuild)
+    index_all(incremental=not full_rebuild, prune_force="--prune-force" in sys.argv)
