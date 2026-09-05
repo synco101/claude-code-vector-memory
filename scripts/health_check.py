@@ -20,7 +20,7 @@ console = Console()
 
 # Configuration
 DB_PATH = Path(__file__).parent.parent / "chroma_db"
-COLLECTION_NAME = "claude_summaries"
+COLLECTION_NAME = "claude_memory"  # must match index_summaries.py / memory_search.py; "claude_summaries" reported 0 docs while search worked (2026-09-05)
 SUMMARIES_DIR = Path.home() / ".claude" / "compacted-summaries"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
