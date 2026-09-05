@@ -89,13 +89,20 @@ class MemoryHealthChecker:
         if self.collection:
             # Get all indexed documents
             try:
-                indexed_docs = self.collection.get()
+                # Paginate: one get() over 200k+ chunks raises "too many SQL variables" in Chroma,
+                # and the except below then reported 0 indexed while search worked (2026-09-05).
                 indexed_filenames = set()
-
-                if indexed_docs and indexed_docs.get("metadatas"):
-                    for metadata in indexed_docs["metadatas"]:
-                        if metadata and "filename" in metadata:
+                offset = 0
+                while True:
+                    page = self.collection.get(limit=5000, offset=offset, include=["metadatas"])
+                    if not page or not page.get("ids"):
+                        break
+                    for metadata in page.get("metadatas") or []:
+                        # Coverage is about compacted summaries only; the store also holds daily
+                        # logs, checkouts, topic files and the wiki (multi-source since 2026-08-28).
+                        if metadata and "filename" in metadata and metadata.get("source_type", "summary") == "summary":
                             indexed_filenames.add(metadata["filename"])
+                    offset += 5000
 
                 coverage["indexed_summaries"] = len(indexed_filenames)
 
@@ -187,7 +194,18 @@ class MemoryHealthChecker:
             return quality
 
         try:
-            docs = self.collection.get()
+            # Same pagination as analyze_coverage: a single get() over the whole store fails.
+            ids: list = []
+            metadatas: list = []
+            offset = 0
+            while True:
+                page = self.collection.get(limit=5000, offset=offset, include=["metadatas"])
+                if not page or not page.get("ids"):
+                    break
+                ids.extend(page["ids"])
+                metadatas.extend(page.get("metadatas") or [])
+                offset += 5000
+            docs = {"ids": ids, "metadatas": metadatas}
             if docs and docs.get("metadatas"):
                 quality["total"] = len(docs["metadatas"])
 
