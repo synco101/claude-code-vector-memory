@@ -6,6 +6,7 @@ Sources:
   1. Compacted summaries: ~/.claude/compacted-summaries/*.md
   2. Auto Memory topic files: ~/.claude/projects/.../memory/*.md
   3. Daily logs: 00-core/.context/memory/daily/*.md
+  4. Session checkpoints: 00-core/.context/session/checkout-*.md
 
 Supports incremental indexing (only new/changed files).
 """
@@ -60,10 +61,46 @@ if not DAILY_LOGS_DIR.exists():
         / "daily"
     )
 
+SESSION_DIR = (
+    Path(__file__).parent.parent.parent.parent
+    / "00-core"
+    / ".context"
+    / "session"
+)
+if not SESSION_DIR.exists():
+    SESSION_DIR = (
+        Path.home()
+        / "Documents"
+        / "Git-Local"
+        / "00-core"
+        / ".context"
+        / "session"
+    )
+
+WIKI_DIR = (
+    Path(__file__).parent.parent.parent.parent / "00-core" / "wiki"
+)
+if not WIKI_DIR.exists():
+    WIKI_DIR = Path.home() / "Documents" / "Git-Local" / "00-core" / "wiki"
+
+# `path_id: True` makes the document id the path relative to the source dir instead of the bare
+# filename. Required for any recursive source: the wiki keeps `inbox/`, `knowledge/`, `projects/`
+# and `people/` side by side, so two `index.md` would otherwise share one id and overwrite each
+# other. The four original sources keep filename ids — changing them would invalidate all 811
+# entries of index_state.json and force a ~28-minute full rebuild for no gain.
+DIARY_DIR = WIKI_DIR.parent.parent / "10-personal" / "20-diary"
+
 SOURCES = {
     "summary": {"dir": SUMMARIES_DIR, "prefix": "summary:"},
     "topic": {"dir": TOPIC_FILES_DIR, "prefix": "topic:"},
     "daily": {"dir": DAILY_LOGS_DIR, "prefix": "daily:"},
+    "session": {"dir": SESSION_DIR, "prefix": "session:", "glob": "checkout-*.md"},
+    # The wiki is Golden Rule #15's compounding knowledge layer, yet none of its 364 files were
+    # searchable by meaning — the only way in was grep on index.md. Added 2026-09-04.
+    "wiki": {"dir": WIKI_DIR, "prefix": "wiki:", "glob": "**/*.md", "path_id": True},
+    # Private voice diary (gitignored folder; ChromaDB is local, so nothing leaves the machine).
+    # Exists for the day-30 recall test «когда было X / что решили про Y». Added 2026-09-16.
+    "diary": {"dir": DIARY_DIR, "prefix": "diary:", "glob": "**/*.md", "path_id": True},
 }
 
 # Tech keywords for metadata extraction
@@ -162,7 +199,71 @@ def create_document_text(content: str, metadata: dict) -> str:
     return "\n".join(parts)
 
 
-def index_all(incremental: bool = True) -> None:
+# --- Chunking -------------------------------------------------------------------------------
+#
+# The embedding model's window is 128 word-piece tokens. Until 2026-08-28 this indexer stored ONE
+# embedding per whole file, so everything past the first ~128 tokens was invisible to search: a
+# 31 460-token daily log was represented by 0.41 % of itself, and the dated archive files created
+# that day embedded only their identical split headers (pairwise cosine up to 0.997). The layer
+# looked configured and was effectively blind — a search for a fact quoted verbatim in an archive
+# returned it 7th out of 10.
+#
+# Calibrated by measurement, not by arithmetic. A first attempt used 330 content characters plus
+# a 60-character overlap on the assumption of 3.08 chars/token; measuring the real chunks gave a
+# MEDIAN of 129 tokens and a maximum of 181 — 122 of 228 chunks were still being truncated by the
+# very window this change exists to respect. Markdown with paths, code spans and issue numbers
+# runs closer to 2.5 chars/token than prose does. Budget below is content + overlap together, and
+# the acceptance test asserts max <= 128 on real files.
+CHARS_PER_TOKEN = 2.5
+CHUNK_CHARS = 230
+CHUNK_OVERLAP_CHARS = 45
+
+
+def chunk_content(content: str) -> list[str]:
+    """Split file content into overlapping, window-sized chunks on line boundaries.
+
+    Line boundaries are kept because these files are Markdown logs: a chunk that starts mid
+    sentence embeds worse than one that starts at a heading or a bullet. A single line longer
+    than the budget is hard-split — a 900-character paragraph is common in these notes.
+    """
+    chunks: list[str] = []
+    buf: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal buf, size
+        if buf:
+            chunks.append("\n".join(buf).strip())
+            buf, size = [], 0
+
+    for line in content.splitlines():
+        if len(line) > CHUNK_CHARS:
+            flush()
+            for i in range(0, len(line), CHUNK_CHARS - CHUNK_OVERLAP_CHARS):
+                piece = line[i : i + CHUNK_CHARS].strip()
+                if piece:
+                    chunks.append(piece)
+            continue
+        if size + len(line) + 1 > CHUNK_CHARS:
+            flush()
+        buf.append(line)
+        size += len(line) + 1
+    flush()
+
+    chunks = [c for c in chunks if c]
+    if not chunks:
+        return []
+
+    # Carry a tail of the previous chunk into the next one so a fact split across the boundary is
+    # still retrievable from at least one side.
+    overlapped = [chunks[0]]
+    for prev, cur in zip(chunks, chunks[1:]):
+        tail = prev[-CHUNK_OVERLAP_CHARS:]
+        overlapped.append(f"{tail}\n{cur}" if tail.strip() else cur)
+    return overlapped
+
+
+def index_all(incremental: bool = True, prune_force: bool = False) -> None:
     """Index all memory sources."""
     console.print("[cyan]Initializing semantic memory system...[/cyan]")
     console.print(f"[cyan]Embedding model: {EMBEDDING_MODEL}[/cyan]")
@@ -185,19 +286,23 @@ def index_all(incremental: bool = True) -> None:
     # Load previous state for incremental indexing
     prev_state = load_index_state() if incremental else {}
     new_state = {}
+    scanned_prefixes = set()   # only prefixes whose directory was actually read this run
     indexed_count = 0
     skipped_count = 0
+    chunk_count = 0
     results = []
 
     for source_type, config in SOURCES.items():
         source_dir = config["dir"]
         prefix = config["prefix"]
+        glob_pattern = config.get("glob", "*.md")
 
         if not source_dir.exists():
             console.print(f"[yellow]Source dir not found: {source_dir}[/yellow]")
             continue
 
-        files = list(source_dir.glob("*.md"))
+        files = [f for f in source_dir.glob(glob_pattern) if f.is_file()]
+        scanned_prefixes.add(prefix)
         console.print(f"\n[cyan]{source_type}: {len(files)} files in {source_dir}[/cyan]")
 
         for filepath in track(files, description=f"Indexing {source_type}..."):
@@ -205,7 +310,9 @@ def index_all(incremental: bool = True) -> None:
             if filepath.name == "MEMORY.md":
                 continue
 
-            doc_id = f"{prefix}{filepath.name}"
+            name = (str(filepath.relative_to(source_dir)) if config.get("path_id")
+                    else filepath.name)
+            doc_id = f"{prefix}{name}"
             mtime = os.path.getmtime(filepath)
             new_state[doc_id] = mtime
 
@@ -221,14 +328,35 @@ def index_all(incremental: bool = True) -> None:
                     continue
 
                 metadata = extract_metadata(content, filepath.name, source_type)
-                doc_text = create_document_text(content, metadata)
 
-                collection.upsert(
-                    ids=[doc_id],
-                    documents=[doc_text],
-                    metadatas=[metadata],
-                )
+                # Chunk count varies as a file is edited, so stale chunks from the previous run
+                # must go before the new ones land — an upsert alone would leave orphans that
+                # still answer queries with deleted text.
+                try:
+                    collection.delete(where={"parent_id": doc_id})
+                except Exception:
+                    pass
 
+                pieces = chunk_content(content)
+                # Chunk 0 is the file's identity card (title, description, type, source) — the
+                # same text the old one-embedding-per-file scheme stored. Keeping it means a
+                # query phrased like a file's description still finds the file.
+                header = create_document_text("", metadata).strip()
+                docs = [header] + pieces
+                ids = [f"{doc_id}#{i}" for i in range(len(docs))]
+                metas = [
+                    {**metadata, "parent_id": doc_id, "chunk_index": i, "n_chunks": len(docs)}
+                    for i in range(len(docs))
+                ]
+
+                for start in range(0, len(docs), 256):
+                    collection.upsert(
+                        ids=ids[start : start + 256],
+                        documents=docs[start : start + 256],
+                        metadatas=metas[start : start + 256],
+                    )
+
+                chunk_count += len(docs)
                 indexed_count += 1
                 results.append({
                     "source": source_type,
@@ -239,11 +367,47 @@ def index_all(incremental: bool = True) -> None:
             except Exception as e:
                 console.print(f"[red]Error indexing {filepath.name}: {e}[/red]")
 
+    # --- prune chunks whose source file is gone -------------------------------------------------
+    # Until 2026-09-04 nothing did this. new_state was rebuilt from what exists on disk and
+    # overwrote the old one, so a deleted OR RENAMED file silently dropped out of the state file
+    # while its chunks stayed in Chroma forever, still answering queries with text that no longer
+    # exists anywhere. The store only looked clean because it had been rebuilt from zero on
+    # 2026-08-28 and nothing had been removed since. That stops being true the moment the weekly
+    # memory pass starts moving rows and splitting topic files, which is exactly what it does.
+    pruned_files = 0
+    if incremental and prev_state:
+        orphans = [
+            doc_id for doc_id in prev_state
+            if doc_id not in new_state
+            # Only prune under a prefix whose directory was actually read this run. A source dir
+            # that is temporarily unreadable (unmounted volume, a TCC denial) is skipped above
+            # with a yellow warning — without this guard that skip would delete every document
+            # of that source.
+            and any(doc_id.startswith(pfx) for pfx in scanned_prefixes)
+        ]
+        # A run that wants to remove more than a fifth of the index is not maintenance, it is an
+        # accident. Report it and change nothing; `--prune-force` is the deliberate override.
+        limit = max(20, len(prev_state) // 5)
+        if len(orphans) > limit and not prune_force:
+            console.print(
+                f"[red]Pruning SKIPPED: {len(orphans)} documents look orphaned, over the safety "
+                f"limit of {limit}. Nothing deleted. Check the source directories, then rerun "
+                f"with --prune-force if this is genuinely correct.[/red]")
+        else:
+            for doc_id in orphans:
+                try:
+                    collection.delete(where={"parent_id": doc_id})
+                    pruned_files += 1
+                except Exception as e:
+                    console.print(f"[red]Error pruning {doc_id}: {e}[/red]")
+            if pruned_files:
+                console.print(f"[yellow]Pruned {pruned_files} documents whose source file is gone[/yellow]")
+
     # Save new state
     save_index_state(new_state)
 
     # Summary
-    console.print(f"\n[green]Indexed: {indexed_count} | Skipped (unchanged): {skipped_count} | Total in DB: {collection.count()}[/green]")
+    console.print(f"\n[green]Indexed: {indexed_count} files -> {chunk_count} chunks | Skipped (unchanged): {skipped_count} | Total in DB: {collection.count()}[/green]")
 
     if results:
         table = Table(title="Newly Indexed Documents")
@@ -265,4 +429,4 @@ if __name__ == "__main__":
     full_rebuild = "--full" in sys.argv
     if full_rebuild:
         console.print("[yellow]Full rebuild mode (ignoring previous state)[/yellow]")
-    index_all(incremental=not full_rebuild)
+    index_all(incremental=not full_rebuild, prune_force="--prune-force" in sys.argv)
