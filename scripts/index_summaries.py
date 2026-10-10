@@ -88,6 +88,8 @@ if not WIKI_DIR.exists():
 # and `people/` side by side, so two `index.md` would otherwise share one id and overwrite each
 # other. The four original sources keep filename ids — changing them would invalidate all 811
 # entries of index_state.json and force a ~28-minute full rebuild for no gain.
+DIARY_DIR = WIKI_DIR.parent.parent / "10-personal" / "20-diary"
+
 SOURCES = {
     "summary": {"dir": SUMMARIES_DIR, "prefix": "summary:"},
     "topic": {"dir": TOPIC_FILES_DIR, "prefix": "topic:"},
@@ -96,6 +98,9 @@ SOURCES = {
     # The wiki is Golden Rule #15's compounding knowledge layer, yet none of its 364 files were
     # searchable by meaning — the only way in was grep on index.md. Added 2026-09-04.
     "wiki": {"dir": WIKI_DIR, "prefix": "wiki:", "glob": "**/*.md", "path_id": True},
+    # Private voice diary (gitignored folder; ChromaDB is local, so nothing leaves the machine).
+    # Exists for the day-30 recall test «когда было X / что решили про Y». Added 2026-09-16.
+    "diary": {"dir": DIARY_DIR, "prefix": "diary:", "glob": "**/*.md", "path_id": True},
 }
 
 # Tech keywords for metadata extraction
